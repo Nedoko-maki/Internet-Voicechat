@@ -131,25 +131,4 @@ class Client:
 
     def stop_talking(self):
         self._audio_handler.stop()
-
-
-def main():
-    try:
-        client = Client()
-
-        ip = input("IP: ")
-        if ":" in ip:
-            ip, port = ip.split(":")
-            port = int(port)
-        else:
-            port = int(input("Port: "))
-
-        client.connect(ip, port)
-        client.start_talking()
-        time.sleep(200)
-    except Exception:
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
+        
