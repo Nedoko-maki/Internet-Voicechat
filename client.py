@@ -64,7 +64,7 @@ class AudioHandler:
                 logging.info("Time out on decoder.")
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
-        data = numpy.frombuffer(in_data, dtype=numpy.ushort)
+        data = numpy.frombuffer(in_data, dtype=config.NUMPY_AUDIO_FORMAT)
         self._encoder.process(data)
         return in_data, pyaudio.paContinue
 
