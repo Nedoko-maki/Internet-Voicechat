@@ -1,9 +1,12 @@
+import time
 import traceback
+
+import config
 import config as a_config
 import pyaudio
 import socket
 import threading
-from queue import Queue
+from queue import Queue, Empty
 
 
 class AudioHandler:
@@ -42,8 +45,8 @@ class AudioHandler:
     def stop(self):
 
         self.in_t_flag.set()
-        self.out_t_flag.set()
         self.in_thread.join()
+        self.out_t_flag.set()
         self.out_thread.join()
 
         self.stream.stop_stream()
@@ -53,23 +56,31 @@ class AudioHandler:
     def aud_in_loop(queue, stream, terminated_flag, config):
 
         while not terminated_flag.is_set():
-            # print("IN THREAD LOOP")
             data = stream.read(config["CHUNK"], exception_on_overflow=True)  # bytes
             queue.put(data)
+            print(f"IN: {queue.qsize()}")
 
     @staticmethod
     def aud_out_loop(queue, stream, terminated_flag):
 
         while not terminated_flag.is_set():
-            data = queue.get()
-            stream.write(data, exception_on_underflow=False)  # bytes
+            try:
+                data = queue.get(block=False)
+                stream.write(data, exception_on_underflow=False)  # bytes
+
+                if queue.qsize() > 100:
+                    queue.queue.clear()  # Queues have a queue attribute that is a deque collections obj.
+
+            except Empty:
+                pass
+            print(f"OUT: {queue.qsize()}")
 
 
 class Client:
     def __init__(self):
         self.aud_in, self.aud_out = Queue(), Queue()
         self.audio_handler = AudioHandler(a_config, self.aud_in, self.aud_out)
-        self.client_thread, self.is_talking = None, threading.Event()
+        self.client_thread, self.is_talking, self.is_connected = None, threading.Event(), False
         self.c_socket = None
 
     def connect(self, ip, port):
@@ -79,31 +90,43 @@ class Client:
             self.c_socket.connect((ip, port))
             self.c_socket.setblocking(False)
             self.c_socket.settimeout(a_config.SOCKET_TIMEOUT)  # around 0.01s is where reverb is noticeable.
+            self.is_connected = True
         except ConnectionRefusedError as e:
             print(e)
+            self.is_connected = False
 
     def start_talking(self):
-        self.is_talking.set()
-        self.client_thread = threading.Thread(target=self.client_loop,
-                                              args=(self.c_socket, self.aud_in, self.aud_out, self.is_talking))
-        self.client_thread.start()
-        self.audio_handler.start()
+        if self.is_connected:
+            self.is_talking.set()
+            self.client_thread = threading.Thread(target=self.client_loop,
+                                                  args=(self.c_socket, self.aud_in, self.aud_out, self.is_talking))
+            self.client_thread.start()
+            self.audio_handler.start()
+
+        else:
+            print("Not connected to a server!")
 
     def stop_talking(self):
         self.is_talking.clear()
         self.client_thread.join()
+        print("Thread joined")
         self.audio_handler.stop()
+        print("Threads joined")
+        self.c_socket.close()
 
     @staticmethod
     def client_loop(c_socket, in_queue, out_queue, t_flag):
         while t_flag.is_set():
             try:
                 try:
-                    out_queue.put(c_socket.recv(a_config.AUDIO["CHUNK"]))
+                    incoming_data = c_socket.recv(a_config.AUDIO["CHUNK"])
+
                 except socket.error as e:
                     print(e)
+                    incoming_data = bytes()
+                out_queue.put(incoming_data)
                 # print(in_queue.qsize())
-                if not in_queue.empty():
+                if in_queue.queue:
                     outgoing_data = in_queue.get()
                     packet_size = c_socket.send(outgoing_data)
 
