@@ -1,156 +1,134 @@
+import config
+import logging
+import numpy
+import pyaudio
+import pyflac
+import queue
+import threading
 import time
 import traceback
-
-import config
-import config as a_config
-import pyaudio
+import select
 import socket
-import threading
-from queue import Queue, Empty
+
+logging.basicConfig(
+    format='%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s',
+    level=logging.INFO,
+    datefmt='%H:%M:%S')
 
 
 class AudioHandler:
-    def __init__(self, audio_config, in_queue, out_queue):
-        self.in_queue, self.out_queue = in_queue, out_queue
-        self.in_thread, self.out_thread = None, None
-        self.in_t_flag, self.out_t_flag = threading.Event(), threading.Event()
-        self.audio_config = audio_config.AUDIO
 
-        self.pa = pyaudio.PyAudio()
-        self.stream = self.pa.open(
-            format=self.audio_config["FORMAT"],
-            channels=self.audio_config["CHANNELS"],
-            rate=self.audio_config["SAMPLE RATE"],
-            input=True,
-            output=True,
-            frames_per_buffer=self.audio_config["CHUNK"]
-        )
+    # AudioHandler class takes care of the audio IO.
+
+    # 1 thread for the audio output, the rest is taken care by callback functions.
+
+    def __init__(self, outgoing_buffer, incoming_buffer):
+        self._pa_obj = pyaudio.PyAudio()
+        self._encoder = pyflac.StreamEncoder(write_callback=self._encoder_callback, sample_rate=config.SAMPLE_RATE)
+        self._decoder = pyflac.StreamDecoder(write_callback=self._decoder_callback)
+        self._stream = None
+
+        self._outgoing_buffer = outgoing_buffer
+        self._incoming_buffer = incoming_buffer
+
+        self._aud_out_flag = threading.Event()
+        self._aud_out_thread = threading.Thread(target=self._audio_out_loop,
+                                               args=(self._decoder, self._incoming_buffer, self._aud_out_flag))
 
     def start(self):
-        self.in_t_flag.clear()
-        self.out_t_flag.clear()
-
-        self.stream.start_stream()
-
-        self.in_thread = threading.Thread(target=self.aud_in_loop,
-                                          args=(self.in_queue, self.stream, self.in_t_flag, self.audio_config),
-                                          daemon=True)
-        self.out_thread = threading.Thread(target=self.aud_out_loop,
-                                           args=(self.out_queue, self.stream, self.out_t_flag),
-                                           daemon=True)
-        # daemon threads will simply exit when the program terminates.
-        self.in_thread.start()
-        self.out_thread.start()
+        self._stream = self._pa_obj.open(
+            format=config.AUDIO_FORMAT,
+            channels=config.CHANNELS,
+            rate=config.SAMPLE_RATE,
+            input=True,
+            output=True,
+            stream_callback=self._audio_callback
+        )
+        self._aud_out_thread.start()
 
     def stop(self):
 
-        self.in_t_flag.set()
-        self.in_thread.join()
-        self.out_t_flag.set()
-        self.out_thread.join()
+        self._aud_out_flag.set()
+        self._aud_out_thread.join()
 
-        self.stream.stop_stream()
-        self.stream.close()
+        self._stream.stop_stream()
+        self._stream.close()
 
     @staticmethod
-    def aud_in_loop(queue, stream, terminated_flag, config):
-
-        while not terminated_flag.is_set():
-            data = stream.read(config["CHUNK"], exception_on_overflow=True)  # bytes
-            queue.put(data)
-            print(f"IN: {queue.qsize()}")
-
-    @staticmethod
-    def aud_out_loop(queue, stream, terminated_flag):
-
-        while not terminated_flag.is_set():
+    def _audio_out_loop(decoder, _queue, t_flag):
+        while t_flag.is_set():
             try:
-                data = queue.get(block=False)
-                stream.write(data, exception_on_underflow=False)  # bytes
+                decoder.process(_queue.get(block=False, timeout=config.DECODER_TIMEOUT))
+                # Making the queue.get() method non-blocking so if the thread needs to be terminated, it can be.
+            except queue.Empty:
+                logging.info("Time out on decoder.")
 
-                if queue.qsize() > 100:
-                    queue.queue.clear()  # Queues have a queue attribute that is a deque collections obj.
+    def _audio_callback(self, in_data, frame_count, time_info, status):
+        data = numpy.frombuffer(in_data, dtype=config.NUMPY_AUDIO_FORMAT)
+        self._encoder.process(data)
+        return in_data, pyaudio.paContinue
 
-            except Empty:
-                pass
-            print(f"OUT: {queue.qsize()}")
+    def _encoder_callback(self, buffer, num_bytes, num_samples, current_frame):
+        self._outgoing_buffer.put(buffer)
+
+    def _decoder_callback(self, data, sample_rate, num_channels, num_samples):
+        self._stream.write(data)
 
 
 class Client:
     def __init__(self):
-        self.aud_in, self.aud_out = Queue(), Queue()
-        self.audio_handler = AudioHandler(a_config, self.aud_in, self.aud_out)
-        self.client_thread, self.is_talking, self.is_connected = None, threading.Event(), False
-        self.c_socket = None
+        # Client class handles the internet IO, and passes the audio data to the AudioHandler class.
 
-    def connect(self, ip, port):
-        self.c_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._outgoing_buffer = queue.Queue()
+        self._incoming_buffer = queue.Queue()
+        self._audio_handler = AudioHandler(self._outgoing_buffer, self._incoming_buffer)
 
-        try:
-            self.c_socket.connect((ip, port))
-            self.c_socket.setblocking(False)
-            self.c_socket.settimeout(a_config.SOCKET_TIMEOUT)  # around 0.01s is where reverb is noticeable.
-            self.is_connected = True
-        except ConnectionRefusedError as e:
-            print(e)
-            self.is_connected = False
+        self._socket = None
+        self._is_connected = False
 
-    def start_talking(self):
-        if self.is_connected:
-            self.is_talking.set()
-            self.client_thread = threading.Thread(target=self.client_loop,
-                                                  args=(self.c_socket, self.aud_in, self.aud_out, self.is_talking))
-            self.client_thread.start()
-            self.audio_handler.start()
-
-        else:
-            print("Not connected to a server!")
-
-    def stop_talking(self):
-        self.is_talking.clear()
-        self.client_thread.join()
-        print("Thread joined")
-        self.audio_handler.stop()
-        print("Threads joined")
-        self.c_socket.close()
+        self._internet_io_flag = threading.Event()
+        self._internet_thread = threading.Thread(target=self._internet_io,
+                                                 args=(self._socket, self._outgoing_buffer,
+                                                       self._incoming_buffer, self._internet_io_flag))
 
     @staticmethod
-    def client_loop(c_socket, in_queue, out_queue, t_flag):
+    def _internet_io(_socket, outgoing_buffer, incoming_buffer, t_flag):
         while t_flag.is_set():
-            try:
-                try:
-                    incoming_data = c_socket.recv(a_config.AUDIO["CHUNK"])
+            readable, writable, exceptional = select.select([_socket], [_socket], [_socket])
 
-                except socket.error as e:
-                    print(e)
-                    incoming_data = bytes()
-                out_queue.put(incoming_data)
-                # print(in_queue.qsize())
-                if in_queue.queue:
-                    outgoing_data = in_queue.get()
-                    packet_size = c_socket.send(outgoing_data)
+            if readable:
+                incoming_buffer.put(_socket.recv(config.PACKET_SIZE))
 
-            except ConnectionResetError:
-                print("Connection forcibly closed by host!")
+            if writable and outgoing_buffer.qsize() > 0:
+                _socket.send(outgoing_buffer.get())
+
+            if exceptional:
+                logging.info("Disconnected!")
                 break
 
+    def connect(self, ip, port):
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Putting the socket here so if the
+        # socket closes, a new socket instance can be made on method call.
 
-def main():
-    try:
-        c = Client()
+        self._is_connected = False
 
-        ip = input("IP: ")
-        if ":" in ip:
-            ip, port = ip.split(":")
-            port = int(port)
+        try:
+            self._socket.connect((ip, port))
+            self._socket.setblocking(False)
+            self._socket.settimeout(config.SOCKET_TIMEOUT)
+            self._is_connected = True
+
+        except ConnectionRefusedError as error:
+            logging.info(error)
+
+    def start_talking(self):
+
+        if self._is_connected:
+            self._audio_handler.start()
+            self._internet_thread.start()
         else:
-            port = int(input("Port: "))
+            logging.info("Not connected to a socket!")
 
-        c.connect(ip, port)
-        c.start_talking()
-    except Exception:
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
+    def stop_talking(self):
+        self._audio_handler.stop()
+        

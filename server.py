@@ -1,83 +1,94 @@
-import time
-
 import config
-from queue import Queue
-import socket
+import logging
+import queue
 import threading
+import select
+import socket
+
+logging.basicConfig(
+    format='%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s',
+    level=logging.INFO,
+    datefmt='%H:%M:%S')
 
 
 class Server:
     def __init__(self):
-        self.s_socket, self.server_thread, self.connection_thread = None, None, None
-        self.is_running = threading.Event()
-        self.connection_queue = Queue()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setblocking(False)
 
-    def start(self):
-
-        self.is_running.clear()
-
-        self.s_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.s_socket.bind((socket.gethostbyname(socket.getfqdn()), config.PORT))
-        self.s_socket.listen(config.MAX_JOIN)
-
-        self.server_thread = threading.Thread(target=self.server_loop, args=(self.is_running, self.connection_queue))
-        self.connection_thread = threading.Thread(target=self.connection_loop,
-                                                  args=(self.is_running, self.s_socket, self.connection_queue))
-        self.server_thread.start()
-        self.connection_thread.start()
-
-    def stop(self):
-        self.is_running.set()
-        self.server_thread.join()
-        self.connection_thread.join()
+        self._server_running_flag = threading.Event()
+        self._server_thread = threading.Thread(target=self._server_loop, args=(self._socket, self._server_running_flag))
 
     @staticmethod
-    def connection_loop(t_flag, s_socket, connection_queue):
-        while not t_flag.is_set():
-            client_socket, ip_address = s_socket.accept()
-            client_socket.setblocking(False)
-            client_socket.settimeout(config.SOCKET_TIMEOUT)
-            connection_queue.put((client_socket, ip_address))
-            print(f"Connection successful from: {ip_address}")
+    def _server_loop(server_socket, t_flag):
 
-    @staticmethod
-    def server_loop(t_flag, connection_queue):
-
-        connections = {}
-        disconnects = []
+        inputs = [server_socket]
+        outputs = []
+        data_buffers = {}
 
         while not t_flag.is_set():
+            readable, writable, exceptional = select.select(inputs, outputs, inputs)
 
-            for d in disconnects:
-                connections[d].close()
-                del connections[d]
-            disconnects = []
+            for sock in readable:
+                if sock is server_socket:
+                    client_socket, client_address = sock.accept()
+                    #  if the server socket turns up in the inputs list, it means a new socket has connected to the
+                    #  server socket.
+                    client_socket.setblocking(False)
+                    inputs.append(client_socket)
+                    data_buffers[client_socket] = queue.Queue()
 
-            if not connection_queue.empty():
-                _client, _ip_address = connection_queue.get()
-                connections[_ip_address] = _client
+                    logging.info(f"Connection successful from {client_address}")
 
-            for idx, (key, client) in enumerate(connections.items()):
+                else:
+                    data = sock.recv(config.PACKET_SIZE)
+                    if data:  # if the data isn't determined to be false, then add to buffer
+                        data_buffers[sock].put(data)
+                        if sock not in outputs:
+                            outputs.append(sock)
+
+                    else:  # if empty, remove/disconnect client socket
+
+                        logging.info(f"Disconnect from {sock.getpeername()}, Empty.")
+
+                        inputs.remove(sock)
+                        if sock in outputs:
+                            outputs.remove(sock)
+                        sock.close()
+                        del data_buffers[sock]
+
+            for sock in writable:
                 try:
-                    try:
-                        data = client.recv(config.AUDIO["CHUNK"])
-                    except socket.error:
-                        data = bytes()  # It likes timing out a lot.
+                    data = data_buffers[sock].get_nowait()
+                except queue.Empty:
+                    outputs.remove(sock)
+                else:
+                    sock.send(data)
 
-                    for idx_2, (key, client_2) in enumerate(connections.items()):
-                        # if not idx == idx_2:
-                        client_2.send(data)
-                except ConnectionResetError as e:
-                    print(f"Disconnect from {key}")
-                    disconnects.append(key)
+            for sock in exceptional:  # if any errors happen with the client socket, disconnect the socket.
+                logging.info(f"Disconnect from {sock.getpeername()}")
 
+                inputs.remove(sock)
+                if sock in outputs:
+                    outputs.remove(sock)
+                sock.close()
+                del data_buffers[sock]
 
-def main():
-    print(socket.gethostbyname(socket.getfqdn()))
+    def start_server(self):
 
-    s = Server()
-    s.start()
+        self._server_running_flag.clear()
 
+        local_ip = socket.gethostbyname(socket.getfqdn())
+        self._socket.bind((local_ip, config.SERVER_PORT))
+        self._socket.listen(config.MAX_JOINABLE)
 
-if __name__ == "__main__":
-    main()
+        self._server_thread.start()
+
+        logging.info(f"Server started from IP: {local_ip}, port: {config.SERVER_PORT}")
+
+        return local_ip, config.SERVER_PORT
+
+    def stop_server(self):
+        self._server_running_flag.set()
+        self._socket.close()
+        
