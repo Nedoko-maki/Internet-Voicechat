@@ -96,7 +96,7 @@ class Client:
 
         outgoing_buffer, incoming_buffer = buffers
 
-        while t_flag.is_set():
+        while not t_flag.is_set():
             readable, writable, exceptional = select.select([_socket], [_socket], [_socket])
 
             if readable:
