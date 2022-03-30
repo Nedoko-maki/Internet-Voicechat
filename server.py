@@ -1,4 +1,4 @@
-import maki_vc.config as config
+import config
 import logging
 import queue
 import threading
