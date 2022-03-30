@@ -5,8 +5,6 @@ import pyaudio
 import pyflac
 import queue
 import threading
-import time
-import traceback
 import select
 import socket
 
@@ -33,7 +31,7 @@ class AudioHandler:
 
         self._aud_out_flag = threading.Event()
         self._aud_out_thread = threading.Thread(target=self._audio_out_loop,
-                                               args=(self._decoder, self._incoming_buffer, self._aud_out_flag))
+                                                args=(self._decoder, self._incoming_buffer, self._aud_out_flag))
 
     def start(self):
         self._stream = self._pa_obj.open(
@@ -64,12 +62,12 @@ class AudioHandler:
                 logging.info("Time out on decoder.")
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
-        data = numpy.frombuffer(in_data, dtype=config.NUMPY_AUDIO_FORMAT)
+        data = numpy.frombuffer(in_data, dtype=config.NUMPY_AUDIO_FORMAT)  # converting the bytes obj to a numpy array.
         self._encoder.process(data)
-        return in_data, pyaudio.paContinue
+        return in_data, pyaudio.paContinue  # audio callback expects a tuple return
 
     def _encoder_callback(self, buffer, num_bytes, num_samples, current_frame):
-        self._outgoing_buffer.put(buffer)
+        self._outgoing_buffer.put(buffer)  # buffer is a built-in bytes object.
 
     def _decoder_callback(self, data, sample_rate, num_channels, num_samples):
         self._stream.write(data)
@@ -83,16 +81,21 @@ class Client:
         self._incoming_buffer = queue.Queue()
         self._audio_handler = AudioHandler(self._outgoing_buffer, self._incoming_buffer)
 
-        self._socket = None
+        self._socket, self._socket = None, None
         self._is_connected = False
 
         self._internet_io_flag = threading.Event()
         self._internet_thread = threading.Thread(target=self._internet_io,
-                                                 args=(self._socket, self._outgoing_buffer,
-                                                       self._incoming_buffer, self._internet_io_flag))
+                                                 args=(self._socket,
+                                                       (self._outgoing_buffer, self._incoming_buffer),
+                                                       self._prepend_header,
+                                                       self._internet_io_flag))
 
     @staticmethod
-    def _internet_io(_socket, outgoing_buffer, incoming_buffer, t_flag):
+    def _internet_io(_socket, buffers, prep_header, t_flag):
+
+        outgoing_buffer, incoming_buffer = buffers
+
         while t_flag.is_set():
             readable, writable, exceptional = select.select([_socket], [_socket], [_socket])
 
@@ -106,7 +109,17 @@ class Client:
                 logging.info("Disconnected!")
                 break
 
-    def connect(self, ip, port):
+    @staticmethod
+    def _prepend_header(buffer, metadata):
+        return bytearray(f"{metadata:<{config.HEADER_SIZE}}") + bytearray(buffer)
+
+    def connect(self, ip: str, port: int) -> bool:
+        """
+        :param ip: IP/Hostname of the server.
+        :param port: Port of the server.
+        :return: Boolean if the client is successfully connected.
+        """
+
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Putting the socket here so if the
         # socket closes, a new socket instance can be made on method call.
 
@@ -121,6 +134,15 @@ class Client:
         except ConnectionRefusedError as error:
             logging.info(error)
 
+        return self._is_connected
+
+    def disconnect(self):
+        if self._is_connected:
+            self._socket.close()
+            self._is_connected = False
+        else:
+            logging.info("Not connected to a socket!")
+
     def start_talking(self):
 
         if self._is_connected:
@@ -131,4 +153,3 @@ class Client:
 
     def stop_talking(self):
         self._audio_handler.stop()
-        
