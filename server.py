@@ -1,4 +1,4 @@
-import config
+import maki_vc.config as config
 import logging
 import queue
 import threading
@@ -48,10 +48,10 @@ class Server:
                     data = sock.recv(config.PACKET_SIZE)
                     if data:  # if the data isn't determined to be falsey, then add to the buffer.
                         for out_sock in outputs:  # if the socket isn't the same one that received it, put into
-                            # all other sockets' outgoing buffers. 
+                            # all other sockets' outgoing buffers.
                             if out_sock != sock:
                                 data_buffers[out_sock].put(data)
-                        
+
                         if sock not in outputs:
                             outputs.append(sock)
 
@@ -83,6 +83,12 @@ class Server:
                 del data_buffers[sock]
 
     def start_server(self, ip: str, port: int) -> bool:
+        """
+        :param ip: IP/Hostname of the server.
+        :param port: Port of the server.
+        :return: Boolean if the server has successfully started.
+        """
+
         self._server_running_flag.clear()
 
         try:
