@@ -1,9 +1,10 @@
-import config
+import maki_vc.config as config
 import logging
 import queue
 import threading
 import select
 import socket
+
 
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s',
@@ -34,6 +35,9 @@ class Server:
                     client_socket, client_address = sock.accept()
                     #  if the server socket turns up in the inputs list, it means a new socket has connected to the
                     #  server socket.
+
+                    # ssl_sock = context.wrap_socket(client_socket, server_side=True)
+
                     client_socket.setblocking(False)
                     inputs.append(client_socket)
                     data_buffers[client_socket] = queue.Queue()
@@ -42,8 +46,12 @@ class Server:
 
                 else:
                     data = sock.recv(config.PACKET_SIZE)
-                    if data:  # if the data isn't determined to be false, then add to buffer
-                        data_buffers[sock].put(data)
+                    if data:  # if the data isn't determined to be falsey, then add to the buffer.
+                        for out_sock in outputs:  # if the socket isn't the same one that received it, put into
+                            # all other sockets' outgoing buffers. 
+                            if out_sock != sock:
+                                data_buffers[out_sock].put(data)
+                        
                         if sock not in outputs:
                             outputs.append(sock)
 
@@ -74,21 +82,22 @@ class Server:
                 sock.close()
                 del data_buffers[sock]
 
-    def start_server(self):
-
+    def start_server(self, ip: str, port: int) -> bool:
         self._server_running_flag.clear()
 
-        local_ip = socket.gethostbyname(socket.getfqdn())
-        self._socket.bind((local_ip, config.SERVER_PORT))
-        self._socket.listen(config.MAX_JOINABLE)
+        try:
+            self._socket.bind((ip, port))
+            self._socket.listen(config.MAX_JOINABLE_CLIENTS)
+            self._server_thread.start()
 
-        self._server_thread.start()
+            logging.info(f"Server started from IP: {ip}, port: {port}")
 
-        logging.info(f"Server started from IP: {local_ip}, port: {config.SERVER_PORT}")
+        except ConnectionResetError as e:
+            logging.info(e)
+            self._server_running_flag.set()
 
-        return local_ip, config.SERVER_PORT
+        return self._server_running_flag.is_set()
 
     def stop_server(self):
         self._server_running_flag.set()
         self._socket.close()
-        
