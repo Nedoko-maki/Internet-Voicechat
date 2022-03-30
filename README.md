@@ -3,7 +3,8 @@ Barebones voicechat over the internet, using sockets, pyFLAC as an encoder, and 
 
 TO DO:
 
-- TLS 1.3 Secure connection or encrypt the audio. -> Involves getting a private key and a CA cert. 
+- TLS 1.3 Secure connection or encrypt the audio. -> Involves getting a private key and a CA cert.
+- Implementing a sort of RTP protocol, switching to UDP. Buffers and reconstructs data.  
 - Metadata prepended onto a packet for metadata/different types of data instead of just audio data. 
 
 TO USE:
