@@ -1,12 +1,14 @@
-import config
 import logging
-import numpy
-import pyaudio
-import pyflac
 import queue
-import threading
-import select
 import socket
+import threading
+
+import numpy
+import pyflac
+import select
+import sounddevice as sd
+
+import config
 
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s',
@@ -21,56 +23,43 @@ class AudioHandler:
     # 1 thread for the audio output, the rest is taken care by callback functions.
 
     def __init__(self, outgoing_buffer, incoming_buffer):
-        self._pa_obj = pyaudio.PyAudio()
-        self._encoder = pyflac.StreamEncoder(write_callback=self._encoder_callback, sample_rate=config.SAMPLE_RATE)
+        sd.default.device = (2, 4)
+
+        self._stream = sd.RawStream(samplerate=config.SAMPLE_RATE,
+                                    blocksize=config.PACKET_SIZE,
+                                    channels=config.CHANNELS,
+                                    dtype=numpy.int16,
+                                    callback=self._audio_callback)
+
+        self._encoder = pyflac.StreamEncoder(write_callback=self._encoder_callback, sample_rate=config.SAMPLE_RATE,
+                                             blocksize=config.PACKET_SIZE)
         self._decoder = pyflac.StreamDecoder(write_callback=self._decoder_callback)
-        self._stream = None
 
         self._outgoing_buffer = outgoing_buffer
         self._incoming_buffer = incoming_buffer
 
-        self._aud_out_flag = threading.Event()
-        self._aud_out_thread = threading.Thread(target=self._audio_out_loop,
-                                                args=(self._decoder, self._incoming_buffer, self._aud_out_flag))
+        self._out_buf = None
 
     def start(self):
-        self._stream = self._pa_obj.open(
-            format=config.AUDIO_FORMAT,
-            channels=config.CHANNELS,
-            rate=config.SAMPLE_RATE,
-            input=True,
-            output=True,
-            stream_callback=self._audio_callback
-        )
-        self._aud_out_thread.start()
+        self._stream.start()
 
     def stop(self):
-
-        self._aud_out_flag.set()
-        self._aud_out_thread.join()
-
-        self._stream.stop_stream()
+        self._stream.stop()
         self._stream.close()
 
-    @staticmethod
-    def _audio_out_loop(decoder, _queue, t_flag):
-        while t_flag.is_set():
-            try:
-                decoder.process(_queue.get(block=False, timeout=config.DECODER_TIMEOUT))
-                # Making the queue.get() method non-blocking so if the thread needs to be terminated, it can be.
-            except queue.Empty:
-                logging.info("Time out on decoder.")
+    def _audio_callback(self, indata, outdata, frames: int,
+                        time, status: sd.CallbackFlags) -> None:
+        self._encoder.process(numpy.frombuffer(indata, dtype=numpy.int16))
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        data = numpy.frombuffer(in_data, dtype=config.NUMPY_AUDIO_FORMAT)  # converting the bytes obj to a numpy array.
-        self._encoder.process(data)
-        return in_data, pyaudio.paContinue  # audio callback expects a tuple return
+        if self._incoming_buffer.qsize() > 0:
+            data = self._incoming_buffer.get(block=False)
+            outdata[:] = data.tobytes()
 
     def _encoder_callback(self, buffer, num_bytes, num_samples, current_frame):
         self._outgoing_buffer.put(buffer)  # buffer is a built-in bytes object.
 
     def _decoder_callback(self, data, sample_rate, num_channels, num_samples):
-        self._stream.write(data)
+        self._incoming_buffer.put(data)
 
 
 class Client:
@@ -81,36 +70,41 @@ class Client:
         self._incoming_buffer = queue.Queue()
         self._audio_handler = AudioHandler(self._outgoing_buffer, self._incoming_buffer)
 
-        self._socket, self._socket = None, None
+        self._socket = None
         self._is_connected = False
 
         self._internet_io_flag = threading.Event()
-        self._internet_thread = threading.Thread(target=self._internet_io,
-                                                 args=(self._socket,
-                                                       (self._outgoing_buffer, self._incoming_buffer),
-                                                       self._prepend_header,
-                                                       self._internet_io_flag))
+        self._internet_thread = threading.Thread(target=Client._internet_io, args=(self,))
 
-    @staticmethod
-    def _internet_io(_socket, buffers, prep_header, t_flag):
+    def _internet_io(self,):
 
-        outgoing_buffer, incoming_buffer = buffers
-
-        while not t_flag.is_set():
-            readable, writable, exceptional = select.select([_socket], [_socket], [_socket])
+        while not self._internet_io_flag.is_set():
+            readable, writable, exceptional = select.select([self._socket], [self._socket], [self._socket])
 
             if readable:
-                incoming_buffer.put(_socket.recv(config.PACKET_SIZE))
+                try:
+                    data = self._socket.recv(config.PACKET_SIZE)
+                    self._audio_handler._decoder.process(data)  # messy but since the callback audio func only runs
+                    # whenever it has enough samples of audio to send, the audio needs to be processed by the time it
+                    # does a callback.
+                except ConnectionResetError:
+                    logging.info("Disconnected!")
+                    break
 
-            if writable and outgoing_buffer.qsize() > 0:
-                _socket.send(outgoing_buffer.get())
+            if writable and self._outgoing_buffer.qsize() > 0:
+                data = self._outgoing_buffer.get()
+                try:
+                    self._socket.send(data)
+                except ConnectionResetError:
+                    logging.info("Disconnected!")
+                    break
 
             if exceptional:
                 logging.info("Disconnected!")
                 break
 
     @staticmethod
-    def _prepend_header(buffer, metadata):
+    def _add_header(buffer, metadata):
         return bytearray(f"{metadata:<{config.HEADER_SIZE}}") + bytearray(buffer)
 
     def connect(self, ip: str, port: int) -> bool:
@@ -124,12 +118,15 @@ class Client:
         # socket closes, a new socket instance can be made on method call.
 
         self._is_connected = False
+        logging.info(f"Connecting to {ip}: {port}...")
 
         try:
             self._socket.connect((ip, port))
             self._socket.setblocking(False)
             self._socket.settimeout(config.SOCKET_TIMEOUT)
             self._is_connected = True
+
+            logging.info("Connected!")
 
         except ConnectionRefusedError as error:
             logging.info(error)
