@@ -20,7 +20,7 @@ class AudioHandler:
 
     # AudioHandler class takes care of the audio IO.
 
-    # 1 thread for the audio output, the rest is taken care by callback functions.
+    # No user-threads required! All handled by callback functions.
 
     def __init__(self, outgoing_buffer, incoming_buffer):
         sd.default.device = (2, 4)
@@ -47,18 +47,17 @@ class AudioHandler:
         self._stream.stop()
         self._stream.close()
 
-    def _audio_callback(self, indata, outdata, frames: int,
-                        time, status: sd.CallbackFlags) -> None:
-        self._encoder.process(numpy.frombuffer(indata, dtype=numpy.int16))
+    def _audio_callback(self, in_data, out_data, *_) -> None:
+        self._encoder.process(numpy.frombuffer(in_data, dtype=numpy.int16))
 
         if self._incoming_buffer.qsize() > 0:
             data = self._incoming_buffer.get(block=False)
-            outdata[:] = data.tobytes()
+            out_data[:] = data.tobytes()
 
-    def _encoder_callback(self, buffer, num_bytes, num_samples, current_frame):
+    def _encoder_callback(self, buffer, *_):
         self._outgoing_buffer.put(buffer)  # buffer is a built-in bytes object.
 
-    def _decoder_callback(self, data, sample_rate, num_channels, num_samples):
+    def _decoder_callback(self, data, *_):
         self._incoming_buffer.put(data)
 
 
@@ -74,12 +73,16 @@ class Client:
         self._is_connected = False
 
         self._internet_io_flag = threading.Event()
-        self._internet_thread = threading.Thread(target=Client._internet_io, args=(self,))
+        self._internet_thread = threading.Thread(target=Client._internet_io, args=(self,), daemon=False)
 
-    def _internet_io(self,):
+    def _internet_io(self, ):
 
         while not self._internet_io_flag.is_set():
-            readable, writable, exceptional = select.select([self._socket], [self._socket], [self._socket])
+            try:
+                readable, writable, exceptional = select.select([self._socket], [self._socket], [self._socket])
+            except ValueError:
+                logging.info("Disconnect!")
+                break
 
             if readable:
                 try:
@@ -87,6 +90,7 @@ class Client:
                     self._audio_handler._decoder.process(data)  # messy but since the callback audio func only runs
                     # whenever it has enough samples of audio to send, the audio needs to be processed by the time it
                     # does a callback.
+
                 except ConnectionResetError:
                     logging.info("Disconnected!")
                     break
@@ -95,6 +99,7 @@ class Client:
                 data = self._outgoing_buffer.get()
                 try:
                     self._socket.send(data)
+
                 except ConnectionResetError:
                     logging.info("Disconnected!")
                     break
