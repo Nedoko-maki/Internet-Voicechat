@@ -19,11 +19,12 @@ logging.basicConfig(
 class AudioHandler:
 
     # AudioHandler class takes care of the audio IO.
-
     # No user-threads required! All handled by callback functions.
 
-    def __init__(self, outgoing_buffer, incoming_buffer):
-        sd.default.device = (2, 4)
+    def __init__(self, outgoing_buffer, incoming_buffer, audio_devices=None):
+
+        if audio_devices:
+            sd.default.device = audio_devices
 
         self._stream = sd.RawStream(samplerate=config.SAMPLE_RATE,
                                     blocksize=config.PACKET_SIZE,
@@ -40,13 +41,6 @@ class AudioHandler:
 
         self._out_buf = None
 
-    def start(self):
-        self._stream.start()
-
-    def stop(self):
-        self._stream.stop()
-        self._stream.close()
-
     def _audio_callback(self, in_data, out_data, *_) -> None:
         self._encoder.process(numpy.frombuffer(in_data, dtype=numpy.int16))
 
@@ -60,14 +54,23 @@ class AudioHandler:
     def _decoder_callback(self, data, *_):
         self._incoming_buffer.put(data)
 
+    def start(self):
+        self._stream.start()
+
+    def stop(self):
+        self._stream.stop()
+        self._stream.close()
+
 
 class Client:
-    def __init__(self):
+    def __init__(self, default_audio_devices=None):
+
         # Client class handles the internet IO, and passes the audio data to the AudioHandler class.
 
         self._outgoing_buffer = queue.Queue()
         self._incoming_buffer = queue.Queue()
-        self._audio_handler = AudioHandler(self._outgoing_buffer, self._incoming_buffer)
+        self._audio_handler = AudioHandler(self._outgoing_buffer, self._incoming_buffer,
+                                           audio_devices=default_audio_devices)
 
         self._socket = None
         self._is_connected = False
@@ -111,6 +114,10 @@ class Client:
     @staticmethod
     def _add_header(buffer, metadata):
         return bytearray(f"{metadata:<{config.HEADER_SIZE}}") + bytearray(buffer)
+
+    @staticmethod
+    def get_sound_devices():
+        return sd.query_devices()
 
     def connect(self, ip: str, port: int) -> bool:
         """
