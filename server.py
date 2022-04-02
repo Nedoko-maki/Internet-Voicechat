@@ -1,9 +1,11 @@
-import config
 import logging
 import queue
-import threading
-import select
 import socket
+import threading
+
+import select
+
+import config
 
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s',
@@ -13,13 +15,12 @@ logging.basicConfig(
 
 class Server:
     def __init__(self):
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.setblocking(False)
+        self._socket = None
 
         self._server_running_flag = threading.Event()
-        self._server_thread = threading.Thread(target=Server._server_loop, args=(self,))
+        self._server_thread = None
 
-    def _server_loop(self,):
+    def _server_loop(self, ):
 
         inputs = [self._socket]
         outputs = []
@@ -47,7 +48,6 @@ class Server:
                         data = sock.recv(config.PACKET_SIZE)
                     except ConnectionResetError as e:
                         data = None
-                    logging.info(data)
                     if data:  # if the data isn't determined to be falsey, then add to the buffer.
                         if sock not in outputs:
                             outputs.append(sock)
@@ -58,7 +58,6 @@ class Server:
                             data_buffers[out_sock].put(data)
 
                     else:  # if empty, remove/disconnect client socket
-                        logging.info("ConReset")
                         exceptional.append(sock)
 
             for sock in writable:
@@ -81,6 +80,8 @@ class Server:
                 sock.close()
                 del data_buffers[sock]
 
+        self._socket.close()
+
     def start_server(self, ip: str, port: int) -> bool:
         """
         :param ip: IP/Hostname of the server.
@@ -88,11 +89,14 @@ class Server:
         :return: Boolean if the server has successfully started.
         """
 
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setblocking(False)
         self._server_running_flag.clear()
 
         try:
-            self._socket.bind((ip, port))
+            self._socket.bind((ip, int(port)))
             self._socket.listen(config.MAX_JOINABLE_CLIENTS)
+            self._server_thread = threading.Thread(target=Server._server_loop, args=(self,), daemon=True)
             self._server_thread.start()
 
             logging.info(f"Server started from IP: {ip}, port: {port}")
@@ -105,4 +109,3 @@ class Server:
 
     def stop_server(self):
         self._server_running_flag.set()
-        self._socket.close()
