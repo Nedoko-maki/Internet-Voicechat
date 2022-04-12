@@ -26,7 +26,7 @@ class Server:
         outputs = []
         data_buffers = {}
 
-        while not self._server_running_flag.is_set():
+        while self._server_running_flag.is_set():
             readable, writable, exceptional = select.select(inputs, outputs, inputs)
 
             for sock in readable:
@@ -79,8 +79,9 @@ class Server:
                     outputs.remove(sock)
                 sock.close()
                 del data_buffers[sock]
-
+                
         self._socket.close()
+        self._server_running_flag.clear()
 
     def start_server(self, ip: str, port: int) -> bool:
         """
@@ -88,6 +89,9 @@ class Server:
         :param port: Port of the server.
         :return: Boolean if the server has successfully started.
         """
+
+        if self._server_running_flag.is_set():
+            return True
 
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.setblocking(False)
@@ -97,15 +101,17 @@ class Server:
             self._socket.bind((ip, int(port)))
             self._socket.listen(config.MAX_JOINABLE_CLIENTS)
             self._server_thread = threading.Thread(target=Server._server_loop, args=(self,), daemon=True)
+            self._server_running_flag.set()
+
             self._server_thread.start()
 
             logging.info(f"Server started from IP: {ip}, port: {port}")
 
         except ConnectionResetError as e:
-            logging.info(e)
-            self._server_running_flag.set()
+            logging.error(e)
+            self._server_running_flag.clear()
 
         return self._server_running_flag.is_set()
 
     def stop_server(self):
-        self._server_running_flag.set()
+        self._server_running_flag.clear()
